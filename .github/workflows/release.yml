@@ -21,6 +21,7 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go test -race ./...
+      - run: go test -race -tags e2e ./internal/syncer
       - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
       # The default "docker" driver cannot push multi-platform images with
       # SBOM attestations, which dockers_v2 adds.
