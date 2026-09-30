@@ -1,0 +1,118 @@
+# s3-sync in Kubernetes: one replica with the state on a ReadWriteOnce volume.
+# Replace the placeholders, then:
+#   kubectl apply -n s3-sync -f kubernetes.yaml
+#
+# See what a pass would do without changing anything (works while run is active):
+#   kubectl exec -n s3-sync deploy/s3-sync -- \
+#     s3-sync --config /etc/s3-sync/config.yaml run --dry-run
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-sync
+type: Opaque
+stringData:
+  DO_ACCESS_KEY: "<spaces access key>"
+  DO_SECRET_KEY: "<spaces secret key>"
+  SELECTEL_ACCESS_KEY: "<selectel access key>"
+  SELECTEL_SECRET_KEY: "<selectel secret key>"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3-sync
+data:
+  config.yaml: |
+    providers:
+      do:
+        endpoint: https://fra1.digitaloceanspaces.com
+        region: fra1
+        access_key: ${DO_ACCESS_KEY}
+        secret_key: ${DO_SECRET_KEY}
+        rate_limit:
+          requests_per_bucket: 150
+      selectel:
+        endpoint: https://s3.ru-1.storage.selcloud.ru
+        region: ru-1
+        path_style: true
+        access_key: ${SELECTEL_ACCESS_KEY}
+        secret_key: ${SELECTEL_SECRET_KEY}
+    sync:
+      - source: do/static
+        target: selectel/static
+      - source: do/uploads
+        target: selectel/uploads
+        interval: 5m
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: s3-sync-state
+spec:
+  accessModes: ["ReadWriteOnce"]   # SQLite: local block storage, not NFS
+  resources:
+    requests:
+      storage: 5Gi                 # about 150-200 MB per million objects
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3-sync
+  labels:
+    app.kubernetes.io/name: s3-sync
+spec:
+  replicas: 1                      # never more: one instance per state database
+  strategy:
+    type: Recreate                 # the old pod releases the volume and the lock first
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: s3-sync
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: s3-sync
+    spec:
+      terminationGracePeriodSeconds: 60   # time to abort in-flight multipart uploads
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534                    # makes the volume writable for that user
+      containers:
+        - name: s3-sync
+          image: ghcr.io/metanovii/s3-sync:latest
+          args: ["--config", "/etc/s3-sync/config.yaml", "--logFormat", "json", "run"]
+          envFrom:
+            - secretRef:
+                name: s3-sync
+          ports:
+            - name: http
+              containerPort: 9090
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/s3-sync
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/s3-sync
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: s3-sync
+        - name: state
+          persistentVolumeClaim:
+            claimName: s3-sync-state
+        - name: tmp
+          emptyDir: {}

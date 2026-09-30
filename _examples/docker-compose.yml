@@ -1,0 +1,24 @@
+# One s3-sync container. Secrets come from .env next to this file:
+#
+#   DO_ACCESS_KEY=...
+#   DO_SECRET_KEY=...
+#   SELECTEL_ACCESS_KEY=...
+#   SELECTEL_SECRET_KEY=...
+#
+# Check the configuration first:
+#   docker compose run --rm s3-sync --config /etc/s3-sync/config.yaml validate
+services:
+  s3-sync:
+    image: ghcr.io/metanovii/s3-sync:latest
+    restart: unless-stopped
+    command: ["--config", "/etc/s3-sync/config.yaml", "--logFormat", "json", "run"]
+    env_file: .env
+    ports:
+      - "9090:9090"   # /metrics, /healthz, /readyz
+    volumes:
+      - ./config.yaml:/etc/s3-sync/config.yaml:ro
+      - state:/var/lib/s3-sync   # SQLite state; keep it on a local volume
+    stop_grace_period: 1m        # time to abort in-flight multipart uploads
+
+volumes:
+  state:

@@ -1,0 +1,58 @@
+# Prometheus alerting rules for s3-sync. Thresholds assume the default
+# interval (10m) and timeout (2h); adjust them to your configuration.
+groups:
+  - name: s3-sync
+    rules:
+      - alert: S3SyncNoSuccessfulPass
+        # Also fires when a sync has never succeeded since the process started.
+        expr: time() - s3sync_last_success_timestamp_seconds > 3 * 3600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "s3-sync {{ $labels.source }} -> {{ $labels.target }}: no successful pass for 3 hours"
+          description: "Listing the source or writing the state fails. See the process log (message \"pass finished\" with an error)."
+
+      - alert: S3SyncPassesFailing
+        expr: increase(s3sync_passes_total{result="failure"}[1h]) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "s3-sync {{ $labels.source }} -> {{ $labels.target }}: {{ $value | humanize }} failed passes in the last hour"
+
+      - alert: S3SyncDeletionsHeld
+        expr: s3sync_deletions_held > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "s3-sync {{ $labels.source }} -> {{ $labels.target }}: {{ $value }} deletions held"
+          description: >-
+            More objects vanished from the source than delete.max_count or
+            delete.max_fraction allow, so nothing is deleted in the target.
+            Check the source (keys, prefix, provider status). If the deletions
+            are intended, raise the limit for this sync and restart s3-sync.
+
+      - alert: S3SyncObjectsFailing
+        # A pass succeeds when the listing works, even if every copy fails.
+        expr: s3sync_last_pass_failed_objects > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "s3-sync {{ $labels.source }} -> {{ $labels.target }}: {{ $value }} objects failed in the last pass, for an hour"
+          description: "Copies, deletions or ACL updates keep failing. The first errors of every pass are in the log."
+
+      - alert: S3SyncCopyErrors
+        expr: increase(s3sync_errors_total{operation=~"copy|delete|put_acl|get_acl"}[1h]) > 10
+        labels:
+          severity: warning
+        annotations:
+          summary: "s3-sync {{ $labels.source }} -> {{ $labels.target }}: {{ $value | humanize }} {{ $labels.operation }} errors in the last hour"
+
+      - alert: S3SyncTargetDiffers
+        expr: increase(s3sync_full_check_recopied_total[1d]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "s3-sync {{ $labels.source }} -> {{ $labels.target }}: the full check found {{ $value | humanize }} target objects missing or different"
+          description: "Something other than s3-sync changes the target. The objects were copied again."

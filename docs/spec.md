@@ -34,9 +34,11 @@ so that the CDN can be switched over to it.
 
 See [`config.example.yaml`](../config.example.yaml). Rules:
 
-- Unknown keys are errors.
+- Unknown keys are errors; all errors are reported at once, with the lines
+  of the file.
 - `${NAME}` in any string value is replaced with the environment variable
-  `NAME`. An unset variable is an error; an empty one is allowed.
+  `NAME`. An unset variable is an error; an empty one is allowed. Values that
+  came from the environment are never quoted in error messages.
 - Sizes are written with binary units: `B`, `KiB`, `MiB`, `GiB`, `TiB`.
   Ambiguous units (`M`, `MB`) are rejected.
 - Durations use Go syntax: `90s`, `10m`, `2h`.
@@ -50,13 +52,14 @@ keys starting with `images/`, not `images2/`. Leading and trailing slashes of
 the prefix are ignored.
 
 A key is mapped from source to target by replacing the source prefix with the
-target prefix: with `do/uploads/images` -> `selectel/images`, source key
-`images/a.jpg` becomes target key `a.jpg`. A source key equal to the source
-prefix (a "directory" object such as `images/`) would map to an empty key and
-is skipped.
+target prefix: `<source prefix><rest>` becomes `<target prefix><rest>`. With
+`do/uploads/images` -> `selectel/static/img`, the key `images/a.jpg` of bucket
+`uploads` becomes `img/a.jpg` in bucket `static`. A source key
+equal to the source prefix (a "directory" object such as `images/`) would map
+to an empty key and is skipped.
 
-Bucket names are checked loosely (3 to 255 letters, digits, `.`, `_`, `-`),
-because providers differ and legacy AWS buckets allow upper case.
+Bucket names are checked loosely (3 to 255 letters, digits, `.`, `_`, `-`,
+no `..`), because providers differ and legacy AWS buckets allow upper case.
 
 ### Validation
 
@@ -67,22 +70,24 @@ because providers differ and legacy AWS buckets allow upper case.
 - two targets overlap: same bucket and one prefix contains the other, on the
   same endpoint (host compared case-insensitively, default port ignored) or on
   any two AWS endpoints, since AWS bucket names are global;
-- `workers` is less than 1;
 - a target overlaps any source (this includes cycles between syncs);
+- `workers` is less than 1;
 - more than one provider takes credentials from the AWS SDK default chain
   (no `access_key`/`secret_key`) and at least one of them is not AWS: they
   would silently share the same keys;
 - only one of `access_key` and `secret_key` is set;
 - a value is out of range (see `config.example.yaml`).
 
+`validate --no-env` treats unset environment variables as `"0"`, so that CI
+can check the configuration without its secrets.
+
 ## State
 
-SQLite database at `state.path`, on a local disk (not NFS). The process
-holds an exclusive lock file next to it; a second `s3-sync run` refuses to
-start. Other commands (`confirm-delete`) use the database concurrently with
-`busy_timeout`.
-
-Tables:
+SQLite database at `state.path`, on a local disk (not NFS). `run` holds an
+exclusive lock on `<state.path>.lock`; a second `run` on the same database
+refuses to start. `run --dry-run` works on a copy (`VACUUM INTO` a temporary
+file next to the database, on the same volume) and does not need the lock.
+Copies older than 24 hours, left by crashed dry runs, are removed.
 
 ```sql
 CREATE TABLE syncs (
@@ -91,24 +96,37 @@ CREATE TABLE syncs (
   target_endpoint TEXT NOT NULL,      -- normalized endpoint of the target provider
   pass            INTEGER NOT NULL,   -- number of the last started pass
   last_success    INTEGER,            -- unix time of the last successful pass
-  last_full_check INTEGER,            -- unix time of the last full check
-  confirmed_pass  INTEGER             -- held keys up to this pass may be deleted
+  last_full_check INTEGER             -- unix time of the last target listing
 );
 
 CREATE TABLE objects (
   sync_id        TEXT NOT NULL,
   key            TEXT NOT NULL,       -- source key
-  size           INTEGER NOT NULL,
-  etag           TEXT NOT NULL,       -- source ETag
-  last_modified  INTEGER NOT NULL,    -- source LastModified, unix time
-  acl            TEXT,                -- canned ACL applied to the target copy
+  size           INTEGER NOT NULL,    -- from the source listing
+  etag           TEXT NOT NULL,       -- from the source listing
+  last_modified  INTEGER NOT NULL,    -- from the source listing, whole seconds
+  acl            TEXT NOT NULL,       -- canned ACL set on the target copy, or ''
   copied_at      INTEGER NOT NULL,
-  seen_pass      INTEGER NOT NULL,    -- last pass that saw the key in source
-  missing_since  INTEGER,             -- unix time the key vanished from source
-  held_pass      INTEGER,             -- pass that held its deletion
+  seen_pass      INTEGER NOT NULL,    -- last pass that saw the key in the source
+  missing_since  INTEGER,             -- unix time the key vanished from the source
+  PRIMARY KEY (sync_id, key)
+) WITHOUT ROWID;
+
+CREATE TABLE target_keys (            -- target listing of the current pass
+  sync_id       TEXT NOT NULL,
+  key           TEXT NOT NULL,        -- mapped to the source key
+  size          INTEGER NOT NULL,
+  last_modified INTEGER NOT NULL,
   PRIMARY KEY (sync_id, key)
 ) WITHOUT ROWID;
 ```
+
+Records always hold the values of the source **listing**, not of the
+`GetObject` response: the next listing is compared with them. LastModified is
+kept in whole seconds, as listings have milliseconds and headers do not. If an
+object changed between listing and copying on a provider that ignores
+`If-Match`, the record is stale and the next pass copies the object again, so
+the copy converges.
 
 Losing the database is not data loss: the next pass rebuilds it from the
 target (see "First pass").
@@ -117,49 +135,79 @@ The sync id is built from provider names. If the endpoint of a provider
 changes while its name stays, the stored `source_endpoint` or
 `target_endpoint` no longer matches. Endpoints are stored normalized
 (lower-case host, default port removed), so writing `:443` does not count
-as a change. On a mismatch the rows of that sync are dropped and
-the next pass is a first pass.
+as a change. On a mismatch the rows of that sync are dropped and the next
+pass is a first pass.
 
 ## Pass
 
 1. Increment `syncs.pass`.
-2. List the source with `ListObjectsV2`, page by page. For every page, look
-   the keys up in state and set `seen_pass`. A key is **changed** when it is
-   absent from state or its size, ETag or LastModified differ. The algorithm
-   does not depend on the listing order. Each page is handled in one
-   transaction.
-3. Copy every changed object (see "Copy").
-4. Only if the listing reached the last page without errors: keys of this
-   sync with `seen_pass` lower than the current pass are **missing**. Set
-   `missing_since` for newly missing keys, clear it for keys that are back.
-   Then run "Deletion".
-5. On success, set `last_success`.
+2. If no pass of the sync has listed the target to the end yet (**first
+   pass**, `last_full_check` is empty) or the full check is due, list the
+   target into `target_keys`. An interrupted first pass stays a first pass.
+3. If the full check is due, compare the target with state (see "Full
+   check").
+4. List the source with `ListObjectsV2`, page by page, with
+   `EncodingType=url` (keys with control characters would break the XML
+   otherwise). A page that says it is truncated but has no new continuation
+   token, or does not say whether it is truncated, fails the pass: treating
+   it as the end would make the remaining keys look deleted. For every page, in one
+   transaction, look the keys up in state and set `seen_pass`, clearing
+   `missing_since`. A key is **changed** when it is absent from state or its
+   size, ETag or LastModified differ. The algorithm does not depend on the
+   listing order. Changed keys go to the worker pool; when the pool is full,
+   the listing waits.
+5. Only if the listing reached the last page without errors: keys of this
+   sync with `seen_pass` lower than the current pass get `missing_since`,
+   then "Deletion" runs.
+6. With `acl: copy` and a full check: ACL are re-read (see "ACL").
+7. Set `last_success` (and `last_full_check` after a target listing).
 
-A pass that runs longer than `timeout` is cancelled and counted as failed.
-The next pass starts `interval` after the previous one ends; passes of one
-sync never overlap.
+A pass fails when listing or state access fails. A pass stopped by
+`SIGINT`/`SIGTERM` is not counted as failed. Copies cut by the pass timeout
+or a stop are counted as interrupted, not failed, so a long first copy made
+of several timed-out passes does not raise `s3sync_last_pass_failed_objects`. Failed copies of single
+objects are logged and counted; they have no up-to-date record, so the next
+pass tries them again. A pass that runs longer than `timeout` is cancelled and
+counted as failed. The next pass starts `interval` after the previous one
+ends; passes of one sync never overlap.
 
 ### First pass
 
-When the state has no rows for a sync, the target is listed first into a
-temporary SQLite table (key, size). During the source listing, a changed key
-whose mapped target key is in that table with the same size is recorded as
-copied, with ETag and LastModified taken from the source listing, and is not
-transferred. With `acl: copy` the ACL is still read and applied. This avoids
-copying terabytes again after the database is lost.
+During the source listing of a first pass, a changed key whose mapped target
+key is in `target_keys` with the same size and a LastModified not earlier than
+the source object's is recorded as copied and not transferred (**adopted**).
+A target copy older than the source object is copied again: the source may
+have been replaced by an object of the same size. With `acl` other than `skip` its ACL is still set
+on the target. This avoids copying terabytes again after the database is lost.
 
 ### Copy
 
-- `GetObject` is sent with `If-Match: <ETag from the listing>`. `412
-  Precondition Failed` means the object changed after listing: skip it, the
-  next pass picks it up.
-- The object is streamed to the target, never buffered whole in memory.
-  Objects of 64 MiB or more are uploaded in parts of 64 MiB; the part size
-  grows when the object would need more than 10000 parts.
+- `GetObject` is sent with `If-Match: <ETag from the listing>`.
+  `412 Precondition Failed` means the object changed after listing: it is
+  skipped and the next pass picks it up.
+- The body is streamed from the source to the target, never held in memory.
+  Streamed bodies are signed with `UNSIGNED-PAYLOAD` (the AWS SDK does this by
+  itself only over HTTPS). `Accept-Encoding: identity` keeps compressed
+  objects byte for byte.
+- Objects below 64 MiB: one `PutObject` with `Content-Length`. Larger: a
+  multipart upload with 64 MiB parts, more when the object would need over
+  10000 parts. Every part is a ranged `GetObject` with `If-Match`, so a part
+  is retried alone and all parts come from one version. Any failure or
+  cancellation aborts the upload.
+- An object or part is tried 3 times, with 1 and 2 seconds between tries.
+  HTTP exchanges time out after 1 minute without response headers or 2
+  minutes without data.
+- A multipart copy that does not fit into the pass `timeout` starts over on
+  the next pass; this is logged as a warning.
+- Objects that keep answering `412` on 3 passes in a row are summed up in one
+  warning per pass (keys in the debug log): the provider may compare ETags
+  differently.
+- A listed object that answers `404` is logged with a hint that the provider
+  may encode keys in listings differently.
 - All metadata is copied: `Content-Type`, `Cache-Control`,
   `Content-Encoding`, `Content-Disposition`, `Content-Language`, `Expires`,
   `x-amz-meta-*`.
-- The state row is written only after the target confirmed the upload.
+- The record is written only after the target confirmed the upload.
 
 ### ACL
 
@@ -168,95 +216,100 @@ copying terabytes again after the database is lost.
 - `skip`: ACL are neither read nor written.
 - `copy`: `GetObjectAcl` on the source; the grants are recognised as a
   canned ACL and that canned ACL is applied to the target copy. Owner ids
-  differ between providers, so grants to the owner are matched by being the
+  differ between providers, so the owner's grant is matched by being the
   owner's, not by id:
 
-  | Grants besides `FULL_CONTROL` for the owner                   | Canned ACL           |
-  |---------------------------------------------------------------|----------------------|
-  | none                                                          | `private`            |
-  | `READ` for group `AllUsers`                                   | `public-read`        |
-  | `READ` and `WRITE` for group `AllUsers`                       | `public-read-write`  |
-  | `READ` for group `AuthenticatedUsers`                         | `authenticated-read` |
+  | Grants besides `FULL_CONTROL` for the owner | Canned ACL           |
+  |---------------------------------------------|----------------------|
+  | none                                        | `private`            |
+  | `READ` for group `AllUsers`                 | `public-read`        |
+  | `READ` and `WRITE` for group `AllUsers`     | `public-read-write`  |
+  | `READ` for group `AuthenticatedUsers`       | `authenticated-read` |
 
   Groups are identified by their URI
-  (`http://acs.amazonaws.com/groups/global/AllUsers`,
-  `.../AuthenticatedUsers`). An object with any other grants is copied
-  without ACL and counted in `s3sync_acl_not_copied_objects`.
+  (`http://acs.amazonaws.com/groups/global/AllUsers`, `.../AuthenticatedUsers`,
+  with `http` or `https`). An object with any other grants is copied without
+  ACL and counted in `s3sync_acl_not_copied_total`; each pass logs one summary
+line, the keys are in the debug log.
 - a canned ACL (any of `private`, `public-read`, `public-read-write`,
   `authenticated-read`, `aws-exec-read`, `bucket-owner-read`,
   `bucket-owner-full-control`): applied to every target copy without reading
   the source.
 
 Changing an ACL does not change ETag or LastModified, so the regular pass does
-not see it; the full check does (with `acl: copy`).
+not see it; with `acl: copy` the full check reads every source ACL again and
+applies the ones that changed.
 
 ### Deletion
 
-Target objects whose source key has been missing for at least `delete.delay`
-are **due**. Deletions are computed only after a complete listing (step 4).
+Target copies whose source key has been missing for at least
+`delete.delay` are **due**. Deletions are computed only after a complete
+listing.
 
-Every pass handles two groups separately:
+If the number of due keys exceeds `delete.max_count`, or, when the sync has at
+least `delete.min_count` objects, exceeds `delete.max_fraction` of them,
+nothing is deleted in that pass: the number is exported as
+`s3sync_deletions_held` and logged as a warning. This protects the target
+when the source listing is wrong (changed keys, wrong prefix, a provider
+failure). After checking the source, raise the limit in the configuration (a
+zero limit is no limit) and restart; the next pass deletes them. A key that
+reappears in the source is no longer missing and is not deleted.
 
-1. **Newly due keys** (due, not held). If their number exceeds
-   `delete.max_count`, or, when the sync has at least `delete.min_count`
-   objects, exceeds `delete.max_fraction` of them, none of them is deleted:
-   they get `held_pass` = the current pass. Otherwise they are deleted.
-2. **Held keys** (`held_pass` set). They are deleted only if
-   `held_pass <= syncs.confirmed_pass`. A held key that reappears in the
-   source loses `missing_since` and `held_pass` and is not deleted.
-
-Deleted keys lose their rows. Deletions run through the usual workers and
-rate limits.
-
-`s3-sync confirm-delete <source> <target> --count N` deletes nothing itself.
-It checks that `N` equals the number of held keys and sets
-`syncs.confirmed_pass` to the largest `held_pass`; otherwise it fails and
-prints the current count. Keys held by later passes are not covered: they
-need their own confirmation. Keys that reappeared are no longer held, so the
-confirmation only ever deletes a subset of what the operator saw.
-
-With `delete.enabled: false` missing keys are only recorded.
+Otherwise the due target copies are deleted through the worker pool and their
+records removed. With `delete.enabled: false` missing keys are only recorded.
 
 ### Full check
 
-Every `full_check` the target is listed and compared with state:
+Every `full_check` (0 disables it) the target is listed and compared with
+state:
 
-- size differs or object absent: copy again;
-- object present in the target but not in state: reported in metrics and log,
-  not deleted; keys under `<target prefix>.s3-sync-probe/` are ignored;
-- with `acl: copy`: the source ACL is read again and applied if it changed.
+- a record whose target copy is absent or has another size is dropped, so the
+  same pass copies the object again (`s3sync_full_check_recopied_total`);
+- target objects unknown to state are counted in
+  `s3sync_target_unexpected_objects` and logged, not deleted;
+- keys under `<target prefix>.s3-sync-probe/` are ignored;
+- with `acl: copy`, source ACL are read again and changed ones applied.
 
 Target ETag is never compared with source ETag: for multipart uploads it
 depends on the part layout and differs between providers.
 
-### Incomplete multipart uploads
+## Start-up
 
-On `SIGTERM` in-flight uploads are aborted with `AbortMultipartUpload`. On
-start, `ListMultipartUploads` with the target prefix removes uploads older
-than 24 hours; uploads outside the prefix belong to others and are left
-alone. Selectel has no bucket lifecycle rules, so nothing else cleans them up.
+For every sync, before the first pass (not in dry-run):
 
-## Startup probe
+- probe objects left under `<target prefix>.s3-sync-probe/` by a crash are
+  deleted;
+- incomplete multipart uploads under the target prefix older than 24 hours
+  are aborted (Selectel has no bucket lifecycle rules to do it). A provider
+  that does not implement `ListMultipartUploads` only gets a warning;
+- a probe object `<target prefix>.s3-sync-probe/<random> a+b%20c` is
+  written and listed back; a target that returns the key changed stops the
+  start, since keys with spaces, `+` or `%` would not be mirrored correctly;
+- when `acl` is not `skip`, a probe object
+  `<target prefix>.s3-sync-probe/<random>` is written with the ACL (`copy`
+  probes with `public-read`), its ACL read back and the object deleted. With
+  `acl: copy` one source object's ACL is read as well. A target that rejects
+  or silently ignores the ACL stops the start, instead of every object being
+  copied without it.
 
-When a sync writes ACL (`acl` is not `skip`), the process writes an object
-`<target prefix>.s3-sync-probe/<random>` with an ACL to the target (inside
-the prefix, so it never lands in another sync's target), reads the ACL back and
-deletes the object, whatever `delete.enabled` is. Probe objects left by a
-crash are deleted on the next start. With `acl: copy` it also calls
-`GetObjectAcl` on the source. A failed probe stops the start.
+On `SIGINT`/`SIGTERM` passes are cancelled, in-flight multipart uploads
+aborted, and the process exits after the running operations end.
 
 ## Rate limiting and concurrency
 
 - `workers`: one pool for all copy and delete operations of the process.
-- `rate_limit.requests_per_bucket`: requests per second of every kind (LIST,
-  HEAD, GET, PUT, DELETE, ACL) to one bucket of the provider, shared by all
-  syncs using that bucket.
+- `rate_limit.requests_per_bucket`: requests per second of every kind to one
+  bucket, shared by all syncs using that bucket. Retries made by the AWS SDK
+  itself are not counted.
 - `rate_limit.bandwidth_total`: bytes per second to and from the provider,
   both directions together.
-- `checksum`: `RequestChecksumCalculation` of the AWS SDK. With
-  `when_supported` the SDK adds CRC32 checksums that some S3-compatible
-  providers are reported to reject, so the default is `when_required`, except
-  for AWS endpoints.
+- Limits belong to the endpoint, not to the provider name: two providers with
+  the same endpoint (e.g. different keys) share them, and the smaller
+  configured limit wins.
+- `checksum`: `RequestChecksumCalculation` and `ResponseChecksumValidation`
+  of the AWS SDK. With `when_supported` the SDK adds CRC32 checksums that
+  some S3-compatible providers are reported to reject, so the default is
+  `when_required`, except for AWS endpoints.
 
 ## CLI
 
@@ -266,37 +319,38 @@ Global flags: `--config` (`-c`, default `config.yaml`), `--debug`,
 ```
 s3-sync --config config.yaml run [--dry-run]
 s3-sync --config config.yaml validate [--no-env]
-s3-sync --config config.yaml confirm-delete <source> <target> --count N
 ```
 
-`validate --no-env` treats unset environment variables as `"0"`, so that CI
-can check the configuration without its secrets.
-
-`--dry-run` lists and compares as a normal pass, logs what would be copied and
-deleted, and changes neither the target nor the state.
+`run --dry-run` runs one pass of every sync on a copy of the state, logs what
+would be copied, adopted and deleted, writes nothing to the targets and
+exits. It works while `run` is active.
 
 ## Metrics and health
 
 HTTP on `metrics.listen`: `/metrics`, `/healthz` (process alive), `/readyz`
-(configuration loaded, state open). Metrics carry `source` and `target`
-labels:
+(start-up finished). Metrics carry `source` and `target` labels:
 
-- `s3sync_last_success_timestamp_seconds`
-- `s3sync_pass_duration_seconds`
-- `s3sync_pass_failures_total`
-- `s3sync_objects` (objects in state)
-- `s3sync_copied_objects_total`, `s3sync_copied_bytes_total`
-- `s3sync_deleted_objects_total`
-- `s3sync_deletions_pending` (missing, waiting for `delete.delay`)
-- `s3sync_deletions_held` (blocked by the guards)
-- `s3sync_errors_total{operation}`
-- `s3sync_acl_not_copied_objects`
-- `s3sync_target_unexpected_objects` (found by the full check)
+| Metric | Type | Meaning |
+|---|---|---|
+| `s3sync_last_success_timestamp_seconds` | gauge | end of the last successful pass |
+| `s3sync_pass_duration_seconds` | gauge | duration of the last pass |
+| `s3sync_passes_total{result}` | counter | passes by `success` / `failure` |
+| `s3sync_objects` | gauge | objects in state |
+| `s3sync_copied_objects_total`, `s3sync_copied_bytes_total` | counter | copies |
+| `s3sync_adopted_objects_total` | counter | found already copied on a first pass |
+| `s3sync_skipped_objects_total` | counter | changed during copying (412) |
+| `s3sync_deleted_objects_total` | counter | target copies deleted |
+| `s3sync_deletions_pending` | gauge | missing, waiting for `delete.delay` |
+| `s3sync_deletions_held` | gauge | due but blocked by the delete limits |
+| `s3sync_errors_total{operation}` | counter | `copy`, `delete`, `get_acl`, `put_acl`, `state`, `pass` |
+| `s3sync_last_pass_failed_objects` | gauge | objects that failed in the last pass (interruptions excluded) |
+| `s3sync_acl_not_copied_total` | counter | copied without ACL: grants match no canned ACL |
+| `s3sync_target_unexpected_objects` | gauge | target objects unknown to state |
+| `s3sync_full_check_recopied_total` | counter | copied again by the full check |
 
 ## Deployment in Kubernetes
 
 One replica, `strategy: Recreate`, a `ReadWriteOnce` PVC for the state.
-`confirm-delete` runs with `kubectl exec` in the same pod.
 
 ## Provider notes
 
@@ -309,16 +363,22 @@ One replica, `strategy: Recreate`, a `ReadWriteOnce` PVC for the state.
 - Selectel: object ACL can be read, not set; bucket ACL not supported; bucket
   policy supported; no bucket lifecycle
   ([S3 API](https://docs.selectel.ru/en/api/object-storage-s3/)).
-  Storage class is fixed at bucket creation.
+  Storage class is fixed at bucket creation. Use `acl: skip` and a bucket
+  policy for public access.
+- MinIO (used in the end-to-end tests) does not keep object ACL; the start-up
+  probe detects it.
 - AWS SDK for Go v2 adds request checksums by default
   ([checksums](https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/s3-checksums.html)).
 
-## To verify during implementation
+## Not yet verified on the real providers
 
-- Spaces honours `If-Match` on `GetObject`.
+The end-to-end tests run against MinIO. On Spaces and Selectel still to
+confirm:
+
+- Spaces honours `If-Match` on `GetObject` (without it, see "State").
 - Changing an ACL in Spaces leaves ETag and LastModified unchanged.
-- Selectel accepts or rejects `PutObject` with `x-amz-acl`.
+- Selectel accepts or rejects `PutObject` with `x-amz-acl` (the probe will
+  tell).
 - Spaces and Selectel accept or reject the CRC32 checksums of
   `when_supported`.
-- What `GetObjectAcl` returns in Spaces for the owner and for public objects,
-  to confirm the ACL table.
+- What `GetObjectAcl` returns in Spaces for the owner and for public objects.
