@@ -4,7 +4,11 @@
 //
 //	go test -tags e2e ./internal/syncer
 //
-// S3SYNC_E2E_IMAGE overrides the image (default quay.io/minio/minio:latest).
+// The official MinIO images need a registry login now, so the default is
+// the Bitnami build of MinIO, pinned by digest. S3SYNC_E2E_IMAGE overrides
+// the image and S3SYNC_E2E_CMD its command, e.g.
+//
+//	S3SYNC_E2E_IMAGE=quay.io/minio/minio:latest S3SYNC_E2E_CMD="server /data"
 package syncer
 
 import (
@@ -12,6 +16,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -43,12 +48,18 @@ func TestMain(m *testing.M) {
 	zerolog.SetGlobalLevel(zerolog.WarnLevel)
 	image := os.Getenv("S3SYNC_E2E_IMAGE")
 	if image == "" {
-		image = "quay.io/minio/minio:latest"
+		// bitnamilegacy/minio:2025.5.24
+		image = "bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c"
 	}
-	out, err := exec.Command("docker", "run", "-d", "--rm", "-p", "127.0.0.1::9000",
-		"-e", "MINIO_ROOT_USER=minioadmin", "-e", "MINIO_ROOT_PASSWORD=minioadmin",
-		image, "server", "/data").Output()
+	args := []string{"run", "-d", "--rm", "-p", "127.0.0.1::9000",
+		"-e", "MINIO_ROOT_USER=minioadmin", "-e", "MINIO_ROOT_PASSWORD=minioadmin", image}
+	args = append(args, strings.Fields(os.Getenv("S3SYNC_E2E_CMD"))...)
+	out, err := exec.Command("docker", args...).Output()
 	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			err = fmt.Errorf("%w: %s", err, ee.Stderr)
+		}
 		fmt.Fprintln(os.Stderr, "cannot start MinIO:", err)
 		os.Exit(1)
 	}
@@ -60,13 +71,13 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	endpoint = "http://" + strings.TrimSpace(strings.Split(string(port), "\n")[0])
-	for i := 0; ; i++ {
+	for i := 0; ; i++ { // the Bitnami image takes a few seconds to set up
 		resp, err := http.Get(endpoint + "/minio/health/ready")
 		if err == nil && resp.StatusCode == http.StatusOK {
 			_ = resp.Body.Close()
 			break
 		}
-		if i > 60 {
+		if i > 120 {
 			_ = exec.Command("docker", "rm", "-f", id).Run()
 			fmt.Fprintln(os.Stderr, "MinIO did not start")
 			os.Exit(1)
