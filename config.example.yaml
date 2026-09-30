@@ -1,0 +1,61 @@
+# Example configuration. Endpoints, regions and bucket names are placeholders.
+
+state:
+  path: /var/lib/s3-sync/state.db      # local disk only, not NFS; default: /var/lib/s3-sync/state.db
+
+metrics:
+  listen: ":9090"                      # /metrics, /healthz, /readyz; default: ":9090"
+
+workers: 64                            # shared by all syncs in the process; default: 32
+
+providers:
+  do:
+    endpoint: https://fra1.digitaloceanspaces.com
+    region: fra1
+    path_style: false                  # default: false
+    checksum: when_required            # when_required | when_supported; default: when_required, except AWS
+    access_key: ${DO_ACCESS_KEY}       # omit both keys to use the AWS SDK default chain
+    secret_key: ${DO_SECRET_KEY}
+    rate_limit:
+      requests_per_bucket: 150         # per second, all request types, shared by syncs on a bucket; default: 0 (unlimited)
+      bandwidth_total: 100MiB          # per second, whole provider; default: 0 (unlimited)
+  selectel:
+    endpoint: https://s3.ru-1.storage.selcloud.ru
+    region: ru-1
+    path_style: true
+    access_key: ${SELECTEL_ACCESS_KEY}
+    secret_key: ${SELECTEL_SECRET_KEY}
+    rate_limit:
+      requests_per_bucket: 150
+  aws:
+    endpoint: https://s3.eu-central-1.amazonaws.com
+    region: eu-central-1               # no keys: AWS SDK default chain; checksum defaults to when_supported
+
+defaults:
+  interval: 10m                        # pause between the end of one pass and the start of the next; default: 10m
+  timeout: 2h                          # cancel a pass that runs longer; default: 2h
+  full_check: 24h                      # list the target and compare with state; 0 disables; default: 24h
+  acl: skip                            # skip | copy | <canned ACL>; default: skip
+  delete:
+    enabled: true                      # default: true
+    delay: 1h                          # default: 1h
+    min_count: 100                     # below this many objects only max_count applies; default: 100
+    max_fraction: 0.01                 # above either limit deletions are held; default: 0.01
+    max_count: 10000                   # until `s3-sync confirm-delete <source> <target> --count N`; default: 10000
+
+sync:
+  - source: do/static                  # <provider>/<bucket>[/<prefix>]; the prefix is a directory
+    target: selectel/static            # public access via Selectel bucket policy
+
+  - source: do/uploads
+    target: selectel/uploads
+    interval: 5m
+
+  - source: do/uploads/images          # do/uploads/images/a.jpg -> selectel/images/a.jpg
+    target: selectel/images
+
+  - source: do/uploads
+    target: aws/uploads-copy
+    acl: copy
+    delete:
+      enabled: false

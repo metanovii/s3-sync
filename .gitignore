@@ -1,0 +1,8 @@
+coverage.out
+dist/
+bin/
+.idea/*
+/s3-sync
+config.yaml
+*.db
+*.db-*
