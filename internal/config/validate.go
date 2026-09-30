@@ -143,16 +143,16 @@ func (c *Config) overlap(a, b Location) bool {
 	if a.Bucket != b.Bucket {
 		return false
 	}
-	sameStorage := pa.IsAWS() && pb.IsAWS() || normalizeEndpoint(pa.Endpoint) == normalizeEndpoint(pb.Endpoint)
+	sameStorage := pa.IsAWS() && pb.IsAWS() || NormalizeEndpoint(pa.Endpoint) == NormalizeEndpoint(pb.Endpoint)
 	if !sameStorage {
 		return false
 	}
 	return strings.HasPrefix(a.Prefix, b.Prefix) || strings.HasPrefix(b.Prefix, a.Prefix)
 }
 
-// normalizeEndpoint returns the lower-case host with the default port of the
+// NormalizeEndpoint returns the lower-case host with the default port of the
 // scheme removed.
-func normalizeEndpoint(e string) string {
+func NormalizeEndpoint(e string) string {
 	u, err := url.Parse(e)
 	if err != nil {
 		return e

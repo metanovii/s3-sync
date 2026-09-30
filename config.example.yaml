@@ -40,8 +40,8 @@ defaults:
     enabled: true                      # default: true
     delay: 1h                          # default: 1h
     min_count: 100                     # below this many objects only max_count applies; default: 100
-    max_fraction: 0.01                 # above either limit deletions are held; default: 0.01
-    max_count: 10000                   # until `s3-sync confirm-delete <source> <target> --count N`; default: 10000
+    max_fraction: 0.01                 # above either limit nothing is deleted (s3sync_deletions_held);
+    max_count: 10000                   # raise the limit to let them run; 0 is no limit; defaults: 0.01, 10000
 
 sync:
   - source: do/static                  # <provider>/<bucket>[/<prefix>]; the prefix is a directory
