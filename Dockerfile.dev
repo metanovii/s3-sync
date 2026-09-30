@@ -1,0 +1,13 @@
+FROM golang AS builder
+WORKDIR /code
+COPY go.mod go.sum /code/
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /s3-sync .
+
+FROM alpine:3
+RUN mkdir -p /var/lib/s3-sync
+EXPOSE 9090
+COPY --from=builder /s3-sync /usr/bin/s3-sync
+ENTRYPOINT ["/usr/bin/s3-sync"]
+CMD ["--config", "/etc/s3-sync/config.yaml", "run"]
